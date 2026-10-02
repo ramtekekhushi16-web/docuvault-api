@@ -1,0 +1,21 @@
+services:
+  db:
+    image: postgres:16
+    container_name: docuvault-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: docuvault
+      POSTGRES_PASSWORD: docuvault_password
+      POSTGRES_DB: docuvault
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U docuvault -d docuvault"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres_data:
