@@ -7,26 +7,34 @@ from alembic import context
 
 from app.db.session import Base
 
-# Import all models so SQLAlchemy knows about them
+# Import all models so Alembic can detect them
 from app.models.user import User
 from app.models.document import Document
 from app.models.document_version import DocumentVersion
 from app.models.permission import DocumentPermission
 from app.models.share_link import ShareLink
 from app.models.audit_log import AuditLog
+from app.models.refresh_token import RefreshToken
 
 
+# Alembic Config object
 config = context.config
 
 
+# Configure Python logging
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 
+# Metadata used for autogenerate migrations
 target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
+    """
+    Run migrations in offline mode.
+    """
+
     url = config.get_main_option("sqlalchemy.url")
 
     context.configure(
@@ -34,7 +42,7 @@ def run_migrations_offline() -> None:
         target_metadata=target_metadata,
         literal_binds=True,
         dialect_opts={
-            "paramstyle": "named"
+            "paramstyle": "named",
         },
     )
 
@@ -43,13 +51,18 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
+    """
+    Run migrations in online mode.
+    """
+
     connectable = engine_from_config(
-        config.get_section(config.config_ini_section),
+        config.get_section(config.config_ini_section, {}),
         prefix="sqlalchemy.",
         poolclass=pool.NullPool,
     )
 
     with connectable.connect() as connection:
+
         context.configure(
             connection=connection,
             target_metadata=target_metadata,

@@ -12,3 +12,4 @@ cryptography
 pytest
 httpx
 pytest-cov
+email-validator
