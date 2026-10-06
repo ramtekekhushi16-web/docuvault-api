@@ -5,12 +5,12 @@ from fastapi import (
     APIRouter,
     Depends,
     File,
-    Form,
     HTTPException,
     UploadFile,
     status,
 )
-from fastapi.responses import FileResponse
+from fastapi.responses import Response
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.config import STORAGE_PATH
@@ -23,6 +23,8 @@ from app.models.document import Document
 from app.models.document_version import DocumentVersion
 from app.models.user import User
 from app.schemas.document import DocumentResponse, DocumentUpdate
+from app.utils.audit import create_audit_log
+from app.utils.encryption import decrypt_data, encrypt_data
 
 
 router = APIRouter(
@@ -32,7 +34,7 @@ router = APIRouter(
 
 
 # ============================================================
-# 1. UPLOAD NEW DOCUMENT
+# 1. UPLOAD DOCUMENT
 # ============================================================
 
 @router.post(
@@ -42,12 +44,15 @@ router = APIRouter(
 )
 async def upload_document(
     file: UploadFile = File(...),
-    description: str | None = Form(default=None),
+    description: str | None = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
     Upload a new document.
+
+    The file is encrypted with AES-256-GCM before being
+    written to disk.
     """
 
     if not file.filename:
@@ -56,28 +61,30 @@ async def upload_document(
             detail="Filename is required",
         )
 
-    storage_directory = os.path.abspath(STORAGE_PATH)
-    os.makedirs(storage_directory, exist_ok=True)
+    file_content = await file.read()
+
+    if not file_content:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="File cannot be empty",
+        )
+
+    os.makedirs(STORAGE_PATH, exist_ok=True)
 
     stored_filename = f"{uuid.uuid4().hex}_{file.filename}"
-
     file_path = os.path.join(
-        storage_directory,
+        STORAGE_PATH,
         stored_filename,
     )
 
     try:
-        file_content = await file.read()
-
-        if not file_content:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Uploaded file is empty",
-            )
+        # Encrypt before storing on disk
+        encrypted_content = encrypt_data(file_content)
 
         with open(file_path, "wb") as destination:
-            destination.write(file_content)
+            destination.write(encrypted_content)
 
+        # Create document metadata
         document = Document(
             owner_id=current_user.id,
             filename=stored_filename,
@@ -92,6 +99,7 @@ async def upload_document(
         db.commit()
         db.refresh(document)
 
+        # Create first immutable version
         version = DocumentVersion(
             document_id=document.id,
             version_number=1,
@@ -102,6 +110,15 @@ async def upload_document(
 
         db.add(version)
         db.commit()
+
+        # Audit log
+        create_audit_log(
+            db=db,
+            user_id=current_user.id,
+            document_id=document.id,
+            action="DOCUMENT_UPLOADED",
+            details=f"Uploaded document: {file.filename}",
+        )
 
         return document
 
@@ -152,7 +169,67 @@ def list_documents(
 
 
 # ============================================================
-# 3. GET DOCUMENT METADATA
+# 3. SEARCH DOCUMENTS
+# ============================================================
+
+@router.get(
+    "/search",
+    response_model=list[DocumentResponse],
+)
+def search_documents(
+    q: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Full-text search over document metadata.
+
+    Searches:
+    - original filename
+    - stored filename
+    - description
+
+    PostgreSQL uses:
+    - tsvector
+    - plainto_tsquery
+    - GIN index
+
+    Only documents owned by the current user are returned.
+    """
+
+    query_text = q.strip()
+
+    if not query_text:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Search query cannot be empty",
+        )
+
+    search_query = func.plainto_tsquery(
+        "english",
+        query_text,
+    )
+
+    documents = (
+        db.query(Document)
+        .filter(
+            Document.owner_id == current_user.id,
+            Document.search_vector.op("@@")(search_query),
+        )
+        .order_by(
+            func.ts_rank(
+                Document.search_vector,
+                search_query,
+            ).desc()
+        )
+        .all()
+    )
+
+    return documents
+
+
+# ============================================================
+# 4. GET DOCUMENT METADATA
 # ============================================================
 
 @router.get(
@@ -181,17 +258,17 @@ def get_document(
         )
 
     check_document_permission(
-        document,
-        current_user,
-        db,
-        "Viewer",
+        document=document,
+        current_user=current_user,
+        db=db,
+        required_role="Viewer",
     )
 
     return document
 
 
 # ============================================================
-# 4. UPDATE DOCUMENT METADATA
+# 5. UPDATE DOCUMENT METADATA
 # ============================================================
 
 @router.put(
@@ -200,7 +277,7 @@ def get_document(
 )
 def update_document(
     document_id: int,
-    data: DocumentUpdate,
+    document_data: DocumentUpdate,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -221,22 +298,31 @@ def update_document(
         )
 
     check_document_permission(
-        document,
-        current_user,
-        db,
-        "Editor",
+        document=document,
+        current_user=current_user,
+        db=db,
+        required_role="Editor",
     )
 
-    document.description = data.description
+    document.description = document_data.description
 
     db.commit()
     db.refresh(document)
+
+    # Audit log
+    create_audit_log(
+        db=db,
+        user_id=current_user.id,
+        document_id=document.id,
+        action="DOCUMENT_UPDATED",
+        details="Document metadata updated",
+    )
 
     return document
 
 
 # ============================================================
-# 5. DELETE DOCUMENT
+# 6. DELETE DOCUMENT
 # ============================================================
 
 @router.delete(
@@ -250,7 +336,7 @@ def delete_document(
     """
     Delete a document.
 
-    Only the owner can delete it.
+    Only the owner can delete the document.
     """
 
     document = (
@@ -268,8 +354,18 @@ def delete_document(
     if document.owner_id != current_user.id:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only the document owner can delete this document",
+            detail="Only the document owner can delete the document",
         )
+
+    # Audit BEFORE deleting the document.
+    # This avoids foreign-key problems with audit_logs.document_id.
+    create_audit_log(
+        db=db,
+        user_id=current_user.id,
+        document_id=document.id,
+        action="DOCUMENT_DELETED",
+        details=f"Deleted document: {document.original_filename}",
+    )
 
     versions = (
         db.query(DocumentVersion)
@@ -279,33 +375,32 @@ def delete_document(
         .all()
     )
 
-    storage_directory = os.path.abspath(STORAGE_PATH)
-
+    # Delete physical encrypted files
     for version in versions:
-        version_path = os.path.join(
-            storage_directory,
+        file_path = os.path.join(
+            STORAGE_PATH,
             version.stored_filename,
         )
 
-        if os.path.exists(version_path):
-            os.remove(version_path)
+        if os.path.exists(file_path):
+            os.remove(file_path)
 
-    db.query(DocumentVersion).filter(
-        DocumentVersion.document_id == document.id
-    ).delete(
-        synchronize_session=False
-    )
+    # Delete version records
+    for version in versions:
+        db.delete(version)
 
+    # Delete document
     db.delete(document)
     db.commit()
 
     return {
-        "message": "Document deleted successfully"
+        "message": "Document deleted successfully",
+        "document_id": document_id,
     }
 
 
 # ============================================================
-# 6. DOWNLOAD CURRENT DOCUMENT VERSION
+# 7. DOWNLOAD CURRENT DOCUMENT
 # ============================================================
 
 @router.get(
@@ -317,7 +412,7 @@ def download_document(
     db: Session = Depends(get_db),
 ):
     """
-    Download the current document version.
+    Download and decrypt the current document version.
     """
 
     document = (
@@ -333,10 +428,10 @@ def download_document(
         )
 
     check_document_permission(
-        document,
-        current_user,
-        db,
-        "Viewer",
+        document=document,
+        current_user=current_user,
+        db=db,
+        required_role="Viewer",
     )
 
     version = (
@@ -352,29 +447,57 @@ def download_document(
     if not version:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Document version not found",
+            detail="Current document version not found",
         )
 
     file_path = os.path.join(
-        os.path.abspath(STORAGE_PATH),
+        STORAGE_PATH,
         version.stored_filename,
     )
 
-    if not os.path.isfile(file_path):
+    if not os.path.exists(file_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Physical file not found in storage",
+            detail="Stored file not found",
         )
 
-    return FileResponse(
-        path=file_path,
-        filename=document.original_filename,
+    # Read encrypted file
+    with open(file_path, "rb") as source:
+        encrypted_content = source.read()
+
+    # Decrypt
+    try:
+        decrypted_content = decrypt_data(
+            encrypted_content
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to decrypt document",
+        )
+
+    # Audit log
+    create_audit_log(
+        db=db,
+        user_id=current_user.id,
+        document_id=document.id,
+        action="DOCUMENT_DOWNLOADED",
+        details=f"Downloaded version {document.current_version}",
+    )
+
+    return Response(
+        content=decrypted_content,
         media_type=document.content_type,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{document.original_filename}"'
+            )
+        },
     )
 
 
 # ============================================================
-# 7. UPLOAD NEW DOCUMENT VERSION
+# 8. UPLOAD NEW DOCUMENT VERSION
 # ============================================================
 
 @router.post(
@@ -388,7 +511,7 @@ async def upload_new_version(
     db: Session = Depends(get_db),
 ):
     """
-    Upload a new version of an existing document.
+    Upload a new immutable version of an existing document.
     """
 
     document = (
@@ -404,10 +527,10 @@ async def upload_new_version(
         )
 
     check_document_permission(
-        document,
-        current_user,
-        db,
-        "Editor",
+        document=document,
+        current_user=current_user,
+        db=db,
+        required_role="Editor",
     )
 
     if not file.filename:
@@ -421,43 +544,34 @@ async def upload_new_version(
     if not file_content:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Uploaded file is empty",
+            detail="File cannot be empty",
         )
 
-    storage_directory = os.path.abspath(STORAGE_PATH)
-    os.makedirs(storage_directory, exist_ok=True)
+    os.makedirs(STORAGE_PATH, exist_ok=True)
 
-    stored_filename = f"{uuid.uuid4().hex}_{file.filename}"
+    new_version_number = document.current_version + 1
+
+    stored_filename = (
+        f"{uuid.uuid4().hex}_{file.filename}"
+    )
 
     file_path = os.path.join(
-        storage_directory,
+        STORAGE_PATH,
         stored_filename,
     )
 
     try:
+        # Encrypt before storing
+        encrypted_content = encrypt_data(
+            file_content
+        )
+
         with open(file_path, "wb") as destination:
-            destination.write(file_content)
-
-        latest_version = (
-            db.query(DocumentVersion)
-            .filter(
-                DocumentVersion.document_id == document.id
-            )
-            .order_by(
-                DocumentVersion.version_number.desc()
-            )
-            .first()
-        )
-
-        next_version_number = (
-            latest_version.version_number + 1
-            if latest_version
-            else 1
-        )
+            destination.write(encrypted_content)
 
         version = DocumentVersion(
             document_id=document.id,
-            version_number=next_version_number,
+            version_number=new_version_number,
             stored_filename=stored_filename,
             file_size=len(file_content),
             created_by=current_user.id,
@@ -465,12 +579,38 @@ async def upload_new_version(
 
         db.add(version)
 
-        document.current_version = next_version_number
+        document.filename = stored_filename
+        document.current_version = new_version_number
+        document.original_filename = file.filename
+        document.content_type = (
+            file.content_type
+            or "application/octet-stream"
+        )
 
         db.commit()
         db.refresh(document)
 
+        # Audit log
+        create_audit_log(
+            db=db,
+            user_id=current_user.id,
+            document_id=document.id,
+            action="VERSION_CREATED",
+            details=(
+                f"Created document version "
+                f"{new_version_number}"
+            ),
+        )
+
         return document
+
+    except HTTPException:
+        db.rollback()
+
+        if os.path.exists(file_path):
+            os.remove(file_path)
+
+        raise
 
     except Exception:
         db.rollback()
@@ -485,13 +625,13 @@ async def upload_new_version(
 
 
 # ============================================================
-# 8. LIST DOCUMENT VERSION HISTORY
+# 9. LIST DOCUMENT VERSION HISTORY
 # ============================================================
 
 @router.get(
     "/{document_id}/versions",
 )
-def list_document_versions(
+def list_versions(
     document_id: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
@@ -513,10 +653,10 @@ def list_document_versions(
         )
 
     check_document_permission(
-        document,
-        current_user,
-        db,
-        "Viewer",
+        document=document,
+        current_user=current_user,
+        db=db,
+        required_role="Viewer",
     )
 
     versions = (
@@ -525,7 +665,7 @@ def list_document_versions(
             DocumentVersion.document_id == document.id
         )
         .order_by(
-            DocumentVersion.version_number.asc()
+            DocumentVersion.version_number.desc()
         )
         .all()
     )
@@ -545,24 +685,24 @@ def list_document_versions(
 
 
 # ============================================================
-# 9. RESTORE PREVIOUS VERSION
+# 10. RESTORE PREVIOUS VERSION
 # ============================================================
 
 @router.post(
     "/{document_id}/versions/{version_number}/restore",
     response_model=DocumentResponse,
 )
-def restore_document_version(
+def restore_version(
     document_id: int,
     version_number: int,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
-    Restore a previous document version.
+    Restore a previous version.
 
-    The original version remains unchanged in history.
-    The selected version becomes the current version.
+    The original version is never modified.
+    Restoration creates a new immutable version.
     """
 
     document = (
@@ -578,17 +718,18 @@ def restore_document_version(
         )
 
     check_document_permission(
-        document,
-        current_user,
-        db,
-        "Editor",
+        document=document,
+        current_user=current_user,
+        db=db,
+        required_role="Editor",
     )
 
     version = (
         db.query(DocumentVersion)
         .filter(
             DocumentVersion.document_id == document.id,
-            DocumentVersion.version_number == version_number,
+            DocumentVersion.version_number
+            == version_number,
         )
         .first()
     )
@@ -600,20 +741,96 @@ def restore_document_version(
         )
 
     file_path = os.path.join(
-        os.path.abspath(STORAGE_PATH),
+        STORAGE_PATH,
         version.stored_filename,
     )
 
-    if not os.path.isfile(file_path):
+    if not os.path.exists(file_path):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
-            detail="Version file not found in storage",
+            detail="Version file not found",
         )
 
-    document.filename = version.stored_filename
-    document.current_version = version.version_number
+    # Read encrypted historical version
+    with open(file_path, "rb") as source:
+        encrypted_content = source.read()
 
-    db.commit()
-    db.refresh(document)
+    # Decrypt historical version
+    try:
+        decrypted_content = decrypt_data(
+            encrypted_content
+        )
+    except Exception:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Unable to decrypt selected version",
+        )
 
-    return document
+    # Create a new immutable snapshot
+    new_version_number = (
+        document.current_version + 1
+    )
+
+    restored_filename = (
+        f"{uuid.uuid4().hex}_{document.original_filename}"
+    )
+
+    restored_path = os.path.join(
+        STORAGE_PATH,
+        restored_filename,
+    )
+
+    try:
+        # Encrypt restored content again
+        restored_encrypted_content = encrypt_data(
+            decrypted_content
+        )
+
+        with open(
+            restored_path,
+            "wb",
+        ) as destination:
+            destination.write(
+                restored_encrypted_content
+            )
+
+        restored_version = DocumentVersion(
+            document_id=document.id,
+            version_number=new_version_number,
+            stored_filename=restored_filename,
+            file_size=len(decrypted_content),
+            created_by=current_user.id,
+        )
+
+        db.add(restored_version)
+
+        document.filename = restored_filename
+        document.current_version = new_version_number
+
+        db.commit()
+        db.refresh(document)
+
+        # Audit log
+        create_audit_log(
+            db=db,
+            user_id=current_user.id,
+            document_id=document.id,
+            action="VERSION_RESTORED",
+            details=(
+                f"Restored version {version_number} "
+                f"as new version {new_version_number}"
+            ),
+        )
+
+        return document
+
+    except Exception:
+        db.rollback()
+
+        if os.path.exists(restored_path):
+            os.remove(restored_path)
+
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to restore document version",
+        )
