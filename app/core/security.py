@@ -1,4 +1,6 @@
 import hashlib
+import uuid
+
 from datetime import datetime, timedelta, timezone
 
 import bcrypt
@@ -67,6 +69,7 @@ def create_refresh_token(user_id: int) -> str:
     payload = {
         "sub": str(user_id),
         "type": "refresh",
+        "jti": str(uuid.uuid4()),
         "exp": expire,
     }
 

@@ -9,6 +9,7 @@ from fastapi import (
     UploadFile,
     status,
 )
+
 from fastapi.responses import Response
 from sqlalchemy import func
 from sqlalchemy.orm import Session
@@ -19,10 +20,15 @@ from app.core.dependencies import (
     get_current_user,
 )
 from app.db.session import get_db
+
+from app.models.audit_log import AuditLog
 from app.models.document import Document
 from app.models.document_version import DocumentVersion
+from app.models.permission import DocumentPermission
+from app.models.share_link import ShareLink
 from app.models.user import User
 from app.schemas.document import DocumentResponse, DocumentUpdate
+
 from app.utils.audit import create_audit_log
 from app.utils.encryption import decrypt_data, encrypt_data
 
@@ -325,9 +331,8 @@ def update_document(
 # 6. DELETE DOCUMENT
 # ============================================================
 
-@router.delete(
-    "/{document_id}",
-)
+
+@router.delete("/{document_id}")
 def delete_document(
     document_id: int,
     current_user: User = Depends(get_current_user),
@@ -336,7 +341,9 @@ def delete_document(
     """
     Delete a document.
 
-    Only the owner can delete the document.
+    Only the document owner can delete the document.
+    Related versions, permissions, share links, and audit-log
+    references are handled before deleting the document.
     """
 
     document = (
@@ -357,8 +364,9 @@ def delete_document(
             detail="Only the document owner can delete the document",
         )
 
-    # Audit BEFORE deleting the document.
-    # This avoids foreign-key problems with audit_logs.document_id.
+    # ---------------------------------------------------------
+    # 1. Create deletion audit log
+    # ---------------------------------------------------------
     create_audit_log(
         db=db,
         user_id=current_user.id,
@@ -367,6 +375,45 @@ def delete_document(
         details=f"Deleted document: {document.original_filename}",
     )
 
+    # IMPORTANT:
+    # Flush the new audit log to PostgreSQL before running
+    # the UPDATE below. Otherwise the bulk UPDATE cannot see
+    # the newly-created audit record.
+    db.flush()
+
+    # ---------------------------------------------------------
+    # 2. Remove document references from existing audit logs
+    # ---------------------------------------------------------
+    db.query(AuditLog).filter(
+        AuditLog.document_id == document.id
+    ).update(
+        {
+            AuditLog.document_id: None
+        },
+        synchronize_session=False,
+    )
+
+    # ---------------------------------------------------------
+    # 3. Delete document permissions
+    # ---------------------------------------------------------
+    db.query(DocumentPermission).filter(
+        DocumentPermission.document_id == document.id
+    ).delete(
+        synchronize_session=False
+    )
+
+    # ---------------------------------------------------------
+    # 4. Delete share links
+    # ---------------------------------------------------------
+    db.query(ShareLink).filter(
+        ShareLink.document_id == document.id
+    ).delete(
+        synchronize_session=False
+    )
+
+    # ---------------------------------------------------------
+    # 5. Find all document versions
+    # ---------------------------------------------------------
     versions = (
         db.query(DocumentVersion)
         .filter(
@@ -375,7 +422,9 @@ def delete_document(
         .all()
     )
 
-    # Delete physical encrypted files
+    # ---------------------------------------------------------
+    # 6. Remove encrypted files from storage
+    # ---------------------------------------------------------
     for version in versions:
         file_path = os.path.join(
             STORAGE_PATH,
@@ -385,12 +434,23 @@ def delete_document(
         if os.path.exists(file_path):
             os.remove(file_path)
 
-    # Delete version records
-    for version in versions:
-        db.delete(version)
+    # ---------------------------------------------------------
+    # 7. Delete document version records
+    # ---------------------------------------------------------
+    db.query(DocumentVersion).filter(
+        DocumentVersion.document_id == document.id
+    ).delete(
+        synchronize_session=False
+    )
 
-    # Delete document
+    # ---------------------------------------------------------
+    # 8. Delete document
+    # ---------------------------------------------------------
     db.delete(document)
+
+    # ---------------------------------------------------------
+    # 9. Commit transaction
+    # ---------------------------------------------------------
     db.commit()
 
     return {
