@@ -1,9 +1,9 @@
+import os
 from logging.config import fileConfig
 
-from sqlalchemy import engine_from_config
-from sqlalchemy import pool
-
+from sqlalchemy import engine_from_config, pool
 from alembic import context
+from dotenv import load_dotenv
 
 from app.db.session import Base
 
@@ -17,8 +17,20 @@ from app.models.audit_log import AuditLog
 from app.models.refresh_token import RefreshToken
 
 
+# Load environment variables from .env, if available
+load_dotenv()
+
 # Alembic Config object
 config = context.config
+
+# Use DATABASE_URL from the environment when provided
+database_url = os.getenv("DATABASE_URL")
+
+if database_url:
+    config.set_main_option(
+        "sqlalchemy.url",
+        database_url.replace("%", "%%"),
+    )
 
 
 # Configure Python logging
@@ -26,14 +38,12 @@ if config.config_file_name is not None:
     fileConfig(config.config_file_name)
 
 
-# Metadata used for autogenerate migrations
+# Metadata used for migrations
 target_metadata = Base.metadata
 
 
 def run_migrations_offline() -> None:
-    """
-    Run migrations in offline mode.
-    """
+    """Run migrations without creating a database connection."""
 
     url = config.get_main_option("sqlalchemy.url")
 
@@ -41,9 +51,7 @@ def run_migrations_offline() -> None:
         url=url,
         target_metadata=target_metadata,
         literal_binds=True,
-        dialect_opts={
-            "paramstyle": "named",
-        },
+        dialect_opts={"paramstyle": "named"},
     )
 
     with context.begin_transaction():
@@ -51,9 +59,7 @@ def run_migrations_offline() -> None:
 
 
 def run_migrations_online() -> None:
-    """
-    Run migrations in online mode.
-    """
+    """Run migrations using a live database connection."""
 
     connectable = engine_from_config(
         config.get_section(config.config_ini_section, {}),
@@ -62,7 +68,6 @@ def run_migrations_online() -> None:
     )
 
     with connectable.connect() as connection:
-
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
